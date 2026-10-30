@@ -1,0 +1,85 @@
+name: Build Intel DMG (legacy)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 180
+    env:
+      HERDR_SOURCE_REPOSITORY: ${{ vars.HERDR_SOURCE_REPOSITORY || 'herdrdev/herdr-app' }}
+      HERDR_SOURCE_REF: ${{ vars.HERDR_SOURCE_REF || 'v0.1.9' }}
+      RUST_TARGET: x86_64-apple-darwin
+      # SHA-256 of the upstream scripts/package the Intel overlay was derived from (v0.1.9).
+      UPSTREAM_PACKAGE_SHA256: bd104ffe75046600c8670d2624bbc57eb557d312a04942abb8e83d040010d243
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.HERDR_SOURCE_REPOSITORY }}
+          ref: ${{ env.HERDR_SOURCE_REF }}
+          fetch-depth: 0
+          submodules: true
+          persist-credentials: false
+          token: ${{ secrets.HERDR_SOURCE_TOKEN || github.token }}
+      - name: Checkout build automation
+        uses: actions/checkout@v4
+        with:
+          path: build-automation
+          fetch-depth: 1
+      - name: Verify Intel runner
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          test -x build-automation/scripts/package
+          test -x build-automation/scripts/intel/make-dmg.sh
+      - name: Read upstream toolchain pins
+        id: pins
+        run: |
+          set -euo pipefail
+          wf=.github/workflows/release.yml
+          rust="$(sed -n 's/^[[:space:]]*RUST_TOOLCHAIN:[[:space:]]*\([0-9][0-9.]*\)[[:space:]]*$/\1/p' "$wf" | head -1)"
+          zig="$(awk '/mlugg\/setup-zig/ { f = 1 } f && $1 == "version:" { print $2; exit }' "$wf")"
+          [[ "$rust" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$zig" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "error: cannot read upstream toolchain pins (rust=${rust:-none} zig=${zig:-none})" >&2; exit 1; }
+          echo "rust=$rust" >> "$GITHUB_OUTPUT"
+          echo "zig=$zig" >> "$GITHUB_OUTPUT"
+      - name: Validate supported Herdr integration
+        run: |
+          set -euo pipefail
+          test -s vendor/ghostty/build.zig || { echo 'error: vendor/ghostty submodule missing' >&2; exit 1; }
+          got="$(shasum -a 256 scripts/package | cut -d' ' -f1)"
+          [[ "$got" == "$UPSTREAM_PACKAGE_SHA256" ]] || { echo "error: upstream scripts/package changed (sha256 $got, overlay validated against $UPSTREAM_PACKAGE_SHA256); re-derive build-automation/scripts/package before building" >&2; exit 1; }
+      - name: Apply Intel build integration
+        run: |
+          set -euo pipefail
+          cp build-automation/scripts/package scripts/package
+          chmod +x scripts/package
+          bash -n scripts/package
+          grep -q 'INTEL-BUILD' scripts/package
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ steps.pins.outputs.rust }}
+          targets: x86_64-apple-darwin
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ steps.pins.outputs.zig }}
+      - name: Build and pack Herdr
+        run: scripts/package "$RUST_TARGET"
+      - name: Package DMG
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          mkdir -p dist/unpacked
+          tar -xzf dist/herdr-app-macos-x86_64.tar.gz -C dist/unpacked
+          ./build-automation/scripts/intel/make-dmg.sh dist/unpacked/Herdr.app "dist/Herdr-${version}-macos-x86_64.dmg"
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Herdr-Intel-macOS-legacy
+          path: dist/*.dmg
+          if-no-files-found: error
+          retention-days: 7

@@ -1,0 +1,257 @@
+name: Build Intel DMG (strict + release)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Optional release tag, e.g. herdr-0.1.9-intel1; blank means artifact only'
+        required: false
+        type: string
+      upstream_ref:
+        description: 'Herdr tag or branch to build; blank uses HERDR_SOURCE_REF or v0.1.9'
+        required: false
+        default: ''
+        type: string
+      screenshot_test:
+        description: 'Also run the upstream native screenshot test (needs working Metal on the runner)'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 180
+    env:
+      HERDR_SOURCE_REPOSITORY: ${{ vars.HERDR_SOURCE_REPOSITORY || 'herdrdev/herdr-app' }}
+      HERDR_SOURCE_REF: ${{ inputs.upstream_ref || vars.HERDR_SOURCE_REF || 'v0.1.9' }}
+      RUST_TARGET: x86_64-apple-darwin
+      # SHA-256 of the upstream scripts/package the Intel overlay was derived from (v0.1.9).
+      UPSTREAM_PACKAGE_SHA256: bd104ffe75046600c8670d2624bbc57eb557d312a04942abb8e83d040010d243
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.HERDR_SOURCE_REPOSITORY }}
+          ref: ${{ env.HERDR_SOURCE_REF }}
+          fetch-depth: 0
+          submodules: true
+          persist-credentials: false
+          token: ${{ secrets.HERDR_SOURCE_TOKEN || github.token }}
+      - name: Checkout build automation
+        uses: actions/checkout@v4
+        with:
+          path: build-automation
+          fetch-depth: 1
+      - name: Preflight release tag
+        if: ${{ inputs.release_tag != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" != *.dmg ]] || { echo 'error: release_tag is a GitHub tag, not a .dmg filename' >&2; exit 1; }
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then
+            echo "error: release tag already exists: $TAG" >&2
+            exit 1
+          fi
+      - name: Verify native Intel toolchain
+        run: |
+          set -euo pipefail
+          [[ "$(uname -m)" == x86_64 ]] || { echo 'error: runner is not Intel' >&2; exit 1; }
+          sw_vers
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-path
+          test -x build-automation/scripts/package
+          test -x build-automation/scripts/intel/make-dmg.sh
+      - name: Read upstream toolchain pins
+        id: pins
+        run: |
+          set -euo pipefail
+          wf=.github/workflows/release.yml
+          test -f "$wf" || { echo "error: upstream release workflow missing: $wf" >&2; exit 1; }
+          rust="$(sed -n 's/^[[:space:]]*RUST_TOOLCHAIN:[[:space:]]*\([0-9][0-9.]*\)[[:space:]]*$/\1/p' "$wf" | head -1)"
+          zig="$(awk '/mlugg\/setup-zig/ { f = 1 } f && $1 == "version:" { print $2; exit }' "$wf")"
+          [[ "$rust" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "error: cannot read upstream Rust pin from $wf (got: ${rust:-none})" >&2; exit 1; }
+          [[ "$zig" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "error: cannot read upstream Zig pin from $wf (got: ${zig:-none})" >&2; exit 1; }
+          echo "Upstream pins: Rust $rust, Zig $zig"
+          echo "rust=$rust" >> "$GITHUB_OUTPUT"
+          echo "zig=$zig" >> "$GITHUB_OUTPUT"
+      - name: Preflight source contract
+        run: |
+          set -euo pipefail
+          for required in Cargo.toml Cargo.lock scripts/package scripts/mac-sign scripts/macos-entitlements.plist LICENSE THIRD-PARTY-NOTICES assets/icons/Herdr.icns crates/ghostty-sys/build.rs vendor/ghostty/build.zig; do
+            test -s "$required" || { echo "error: source checkout is missing required file: $required" >&2; exit 1; }
+          done
+          grep -q '"x86_64-apple-darwin" => "x86_64-macos"' crates/ghostty-sys/build.rs || { echo 'error: ghostty-sys no longer maps x86_64-apple-darwin to a Zig target' >&2; exit 1; }
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          [[ -n "$version" ]] || { echo 'error: cannot read version from Cargo.toml' >&2; exit 1; }
+          if [[ "$HERDR_SOURCE_REF" == v* && "$HERDR_SOURCE_REF" != "v$version" ]]; then
+            echo "error: source ref $HERDR_SOURCE_REF but Cargo.toml says $version" >&2
+            exit 1
+          fi
+          echo "Source contract OK: herdr-app $version at $(git rev-parse HEAD), ghostty $(git -C vendor/ghostty rev-parse HEAD)"
+      - name: Validate supported Herdr integration
+        run: |
+          set -euo pipefail
+          got="$(shasum -a 256 scripts/package | cut -d' ' -f1)"
+          [[ "$got" == "$UPSTREAM_PACKAGE_SHA256" ]] || { echo "error: upstream scripts/package changed (sha256 $got, overlay validated against $UPSTREAM_PACKAGE_SHA256); re-derive build-automation/scripts/package before building" >&2; exit 1; }
+      - name: Apply Intel build integration
+        run: |
+          set -euo pipefail
+          cp build-automation/scripts/package scripts/package
+          chmod +x scripts/package
+          bash -n scripts/package
+          grep -q 'INTEL-BUILD' scripts/package
+          if grep -q "Intel Macs aren't supported" scripts/package; then echo 'error: overlay still contains the upstream Intel guard' >&2; exit 1; fi
+          if grep -q 'HERDR_APP_RELEASE=1' scripts/package; then echo 'error: overlay still marks the build as an official release' >&2; exit 1; fi
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ steps.pins.outputs.rust }}
+          targets: x86_64-apple-darwin
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ steps.pins.outputs.zig }}
+      - name: Verify toolchain architecture
+        env:
+          RUST_PIN: ${{ steps.pins.outputs.rust }}
+          ZIG_PIN: ${{ steps.pins.outputs.zig }}
+        run: |
+          set -euo pipefail
+          rustc -vV | tee rustc-version.txt
+          grep -q '^host: x86_64-apple-darwin$' rustc-version.txt || { echo 'error: rustc host is not x86_64-apple-darwin' >&2; exit 1; }
+          grep -q "^release: $RUST_PIN$" rustc-version.txt || { echo "error: rustc is not the pinned $RUST_PIN" >&2; exit 1; }
+          [[ "$(zig version)" == "$ZIG_PIN" ]] || { echo "error: zig $(zig version) is not the pinned $ZIG_PIN" >&2; exit 1; }
+          zig_info="$(file -b "$(realpath "$(command -v zig)")")"
+          [[ "$zig_info" == *x86_64* ]] || { echo "error: zig binary is not x86_64 ($zig_info)" >&2; exit 1; }
+      - name: Build the screenshot test
+        if: ${{ inputs.screenshot_test }}
+        run: cargo test --locked --test shot_pixels --no-run
+      - name: Screenshot pixels
+        if: ${{ inputs.screenshot_test }}
+        timeout-minutes: 5
+        env:
+          HERDR_SHOT_NATIVE_TEST: "1"
+        run: cargo test --locked --test shot_pixels
+      - name: Build and pack Herdr
+        run: |
+          set -euo pipefail
+          scripts/package "$RUST_TARGET" 2>&1 | tee build.log
+      - name: Verify app bundle, architecture and runtime
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          tarball=dist/herdr-app-macos-x86_64.tar.gz
+          [[ -s "$tarball" ]] || { echo "error: packed tarball missing or empty: $tarball" >&2; exit 1; }
+          rm -rf dist/unpacked; mkdir -p dist/unpacked
+          tar -xzf "$tarball" -C dist/unpacked
+          app="$GITHUB_WORKSPACE/dist/unpacked/Herdr.app"; exe="$app/Contents/MacOS/Herdr"
+          [[ -d "$app" && -x "$exe" ]] || { echo 'error: Herdr.app or executable missing' >&2; exit 1; }
+          [[ "$(lipo -archs "$exe")" == x86_64 ]] || { echo 'error: main executable is not x86_64' >&2; exit 1; }
+          count=0
+          while IFS= read -r -d '' f; do
+            info="$(file -b "$f")"
+            case "$info" in
+              *Mach-O*)
+                [[ "$info" == *x86_64* ]] || { echo "error: bundle binary has no x86_64 slice: $f ($info)" >&2; exit 1; }
+                count=$((count+1))
+                ;;
+            esac
+          done < <(find "$app" -type f -print0)
+          (( count > 0 )) || { echo 'error: no Mach-O files found in app' >&2; exit 1; }
+          foreign="$(otool -L "$exe" | tail -n +2 | awk '{print $1}' | grep -Ev '^(/usr/lib/|/System/Library/)' || true)"
+          [[ -z "$foreign" ]] || { echo "error: executable links non-system libraries:" >&2; echo "$foreign" >&2; exit 1; }
+          codesign --verify --deep --strict "$app"
+          signature="$(codesign -dvv "$app" 2>&1)"
+          grep -qx 'Signature=adhoc' <<< "$signature" || { echo 'error: expected an ad hoc signed community build' >&2; echo "$signature" >&2; exit 1; }
+          plist_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")"
+          [[ "$plist_version" == "$version" ]] || { echo "error: Info.plist version $plist_version, Cargo.toml $version" >&2; exit 1; }
+          cmp "$app/Contents/Resources/LICENSE" LICENSE
+          cmp "$app/Contents/Resources/THIRD-PARTY-NOTICES" THIRD-PARTY-NOTICES
+          minos="$(otool -l "$exe" | awk '/LC_BUILD_VERSION/ { f = 1 } f && $1 == "minos" { print $2; exit }')"
+          "$exe" --version > version.txt
+          grep -qx "herdr-app $version" version.txt || { echo "error: unexpected --version output: $(cat version.txt)" >&2; exit 1; }
+          "$exe" --skill > skill.txt
+          [[ -s skill.txt ]] || { echo 'error: --skill printed nothing' >&2; exit 1; }
+          {
+            echo "herdr_app_version=$version"
+            echo "version_output=$(cat version.txt)"
+            echo "main_executable=$(file -b "$exe")"
+            echo "lipo_archs=$(lipo -archs "$exe")"
+            echo "native_macho_files=$count"
+            echo "non_x86_64_macho_files=0"
+            echo "linked_libraries=system only (/usr/lib, /System/Library)"
+            echo "minos=${minos:-unknown}"
+            echo "skill_manual_bytes=$(wc -c < skill.txt | tr -d ' ')"
+            echo "codesign=adhoc; not Developer ID signed; not notarized"
+            echo "self_update=disabled; HERDR_APP_RELEASE not set"
+          } > runtime-diagnostics.txt
+          cat runtime-diagnostics.txt
+          echo "HERDR_APP=$app" >> "$GITHUB_ENV"
+          echo "HERDR_VERSION=$version" >> "$GITHUB_ENV"
+      - name: Package and verify DMG
+        env:
+          RUST_PIN: ${{ steps.pins.outputs.rust }}
+          ZIG_PIN: ${{ steps.pins.outputs.zig }}
+        run: |
+          set -euo pipefail
+          dmg="$GITHUB_WORKSPACE/dist/Herdr-${HERDR_VERSION}-macos-x86_64.dmg"
+          ./build-automation/scripts/intel/make-dmg.sh "$HERDR_APP" "$dmg"
+          dmg_count="$(find "$GITHUB_WORKSPACE/dist" -maxdepth 1 -type f -name '*.dmg' -size +0c -print | wc -l | tr -d ' ')"
+          [[ "$dmg_count" == 1 ]] || { echo "error: expected exactly one non-empty DMG, found $dmg_count" >&2; find "$GITHUB_WORKSPACE/dist" -maxdepth 1 -type f -name '*.dmg' -print >&2; exit 1; }
+          hdiutil verify "$dmg"
+          mnt="$(mktemp -d)"
+          hdiutil attach -readonly -nobrowse -mountpoint "$mnt" "$dmg" >/dev/null
+          trap 'hdiutil detach "$mnt" >/dev/null 2>&1 || true' EXIT
+          [[ "$(lipo -archs "$mnt/Herdr.app/Contents/MacOS/Herdr")" == x86_64 ]] || { echo 'error: DMG app is not x86_64' >&2; exit 1; }
+          [[ -L "$mnt/Applications" ]] || { echo 'error: DMG has no Applications link' >&2; exit 1; }
+          hdiutil detach "$mnt" >/dev/null; trap - EXIT
+          (cd dist && shasum -a 256 "$(basename "$dmg")" herdr-app-macos-x86_64.tar.gz) | tee SHA256SUMS
+          file "$dmg" | tee dmg-file.txt
+          printf 'archive_workflow_commit=%s\narchive_branch=%s\nworkflow_run=%s\nsource_repository=%s\nsource_ref=%s\nsource_commit=%s\nsource_version=%s\nghostty_commit=%s\nrust_toolchain=%s\nzig_version=%s\nrust_target=%s\ntarget_architecture=x86_64\nrunner=%s\nrunner_macos=%s\nxcode=%s\n' \
+            "$GITHUB_SHA" "$GITHUB_REF_NAME" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            "https://github.com/$HERDR_SOURCE_REPOSITORY" "$HERDR_SOURCE_REF" "$(git rev-parse HEAD)" "$HERDR_VERSION" \
+            "$(git -C vendor/ghostty rev-parse HEAD)" "$RUST_PIN" "$ZIG_PIN" "$RUST_TARGET" "$(uname -m)" \
+            "$(sw_vers -productVersion)" "$(xcodebuild -version | head -1)" > build-manifest.txt
+          cat runtime-diagnostics.txt >> build-manifest.txt
+          printf 'dmg=%s\ndmg_sha256=%s\ntarball=herdr-app-macos-x86_64.tar.gz\ntarball_sha256=%s\n' \
+            "$(basename "$dmg")" "$(shasum -a 256 "$dmg" | cut -d' ' -f1)" \
+            "$(shasum -a 256 dist/herdr-app-macos-x86_64.tar.gz | cut -d' ' -f1)" >> build-manifest.txt
+          echo "HERDR_DMG=$dmg" >> "$GITHUB_ENV"
+      - name: Collect diagnostic excerpts
+        run: |
+          set -euo pipefail
+          warnings="$(grep -E 'ld: warning|built for newer macOS|is deprecated' build.log | sort -u | head -50 || true)"
+          {
+            echo 'Targeted excerpts from this Intel macOS build:'
+            echo
+            echo 'Linker, deployment-target and deprecation warnings:'
+            if [[ -n "$warnings" ]]; then sed 's/^/  /' <<< "$warnings"; else echo '  none matched'; fi
+          } > diagnostic-excerpts.txt
+          cat diagnostic-excerpts.txt
+      - name: Upload DMG and diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: Herdr-Intel-macOS-strict-${{ github.run_number }}
+          path: |
+            dist/*.dmg
+            dist/herdr-app-macos-x86_64.tar.gz
+            SHA256SUMS
+            build-manifest.txt
+            runtime-diagnostics.txt
+            diagnostic-excerpts.txt
+            build.log
+            dmg-file.txt
+          if-no-files-found: error
+          retention-days: 30
+      - name: Create GitHub release when requested
+        if: ${{ inputs.release_tag != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" "$HERDR_DMG" dist/herdr-app-macos-x86_64.tar.gz SHA256SUMS build-manifest.txt runtime-diagnostics.txt diagnostic-excerpts.txt --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes "Intel x86_64 Herdr $HERDR_VERSION build of $HERDR_SOURCE_REPOSITORY@$HERDR_SOURCE_REF from $GITHUB_SHA. Ad hoc signed community build, not notarized. See build-manifest.txt and SHA256SUMS."
